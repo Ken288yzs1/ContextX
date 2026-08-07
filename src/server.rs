@@ -1,4 +1,4 @@
-use std::{error::Error, sync::Arc};
+use std::{error::Error, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -16,25 +16,27 @@ use subtle::ConstantTimeEq;
 use crate::{config::AppConfig, grok::GrokClient, mcp::ContextXServer};
 
 const BEARER_PREFIX: &str = "Bearer ";
+/// 上流の推論待ちで通信が無音になり、ゲートウェイに切断されるのを防ぐping間隔です。
+const SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 /// Streamable HTTP形式のMCPサーバーを起動します。
 pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
     let AppConfig {
-        api_key,
-        upstream_url,
-        deep_api_key,
-        deep_upstream_url,
+        standard,
+        deep,
         bind_addr,
         allowed_hosts,
         auth_token,
     } = config;
 
-    let grok_client = GrokClient::new(api_key, upstream_url, deep_api_key, deep_upstream_url)?;
+    let grok_client = Arc::new(GrokClient::new(standard, deep)?);
     let service: StreamableHttpService<ContextXServer, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(ContextXServer::new(grok_client.clone())),
+            move || Ok(ContextXServer::new(Arc::clone(&grok_client))),
             Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
+            StreamableHttpServerConfig::default()
+                .with_allowed_hosts(allowed_hosts)
+                .with_sse_keep_alive(Some(SSE_KEEP_ALIVE)),
         );
 
     let mut mcp_router = Router::new().nest_service("/mcp", service);
