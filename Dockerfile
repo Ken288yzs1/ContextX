@@ -5,9 +5,18 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# 依存関係だけを先にビルドし、レイヤーキャッシュを効かせます。
 COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+    && echo 'fn main() {}' > src/main.rs \
+    && cargo build --locked --release \
+    && rm -rf src
+
 COPY src ./src
-RUN cargo build --locked --release
+# ダミーのmainでビルドされた成果物を破棄し、本体を再ビルドします。
+RUN touch src/main.rs \
+    && cargo build --locked --release
 
 FROM debian:bookworm-slim AS runtime
 
