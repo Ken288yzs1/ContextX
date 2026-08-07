@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -19,13 +21,13 @@ struct SearchParams {
 /// contextXのMCPリクエストを処理します。
 #[derive(Clone)]
 pub struct ContextXServer {
-    grok_client: GrokClient,
+    grok_client: Arc<GrokClient>,
     #[expect(dead_code, reason = "tool_handlerマクロがこのルーターを参照します")]
     tool_router: ToolRouter<Self>,
 }
 
 impl ContextXServer {
-    pub fn new(grok_client: GrokClient) -> Self {
+    pub fn new(grok_client: Arc<GrokClient>) -> Self {
         Self {
             grok_client,
             tool_router: Self::tool_router(),
