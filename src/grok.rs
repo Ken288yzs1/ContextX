@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -6,83 +6,74 @@ use reqwest::{Client, Response, header::CONTENT_TYPE};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::config::{ApiFormat, UpstreamConfig};
+
 /// 利用者からモデルを変更できないよう、各検索機能の上流モデルを固定します。
 const FAST_MODEL: &str = "grok-4.3";
 const DEEP_MODEL: &str = "grok-4.20-multi-agent-0309";
+/// 深度検索では最大限の推論を行わせます。
+const DEEP_REASONING_EFFORT: &str = "xhigh";
 /// 上流モデルへの固定指示は英語で記述し、利用者の入力言語で回答させます。
 const FAST_INSTRUCTIONS: &str = "You are a web search assistant. Search the web and X when relevant. Provide an accurate and concise answer in the same language as the user's query. Include direct source URLs whenever available. Never fabricate sources, URLs, or claims. If no reliable information is available, clearly state that no reliable information was found and briefly suggest how to verify it. Never return an empty response.";
 const DEEP_INSTRUCTIONS: &str = "You are a deep research assistant. Conduct a comprehensive search of the web and X when relevant, and cross-check multiple reliable sources. Provide a detailed and well-structured answer in the same language as the user's query. Include direct source URLs whenever available, distinguish confirmed facts from uncertainty, and never fabricate sources, URLs, or claims. If no reliable information is available, clearly state that no reliable information was found and explain how to verify it. Never return an empty response.";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// 互換APIがstream指定を無視してJSONを返す場合にも備え、両方の形式を受け付けます。
+const ACCEPT_VALUE: &str = "text/event-stream, application/json";
+/// 深度検索の推論が長時間に及ぶため、十分な待機時間を確保します。
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const ERROR_BODY_LIMIT: usize = 1_000;
 
 /// Grok互換APIへのリクエストを担当するクライアントです。
-#[derive(Clone)]
 pub struct GrokClient {
     client: Client,
-    standard: Upstream,
-    deep: Upstream,
-}
-
-#[derive(Clone)]
-struct Upstream {
-    api_key: Arc<str>,
-    url: Arc<str>,
+    standard: UpstreamConfig,
+    deep: UpstreamConfig,
 }
 
 impl GrokClient {
-    pub fn new(
-        api_key: Arc<str>,
-        upstream_url: Arc<str>,
-        deep_api_key: Arc<str>,
-        deep_upstream_url: Arc<str>,
-    ) -> Result<Self, reqwest::Error> {
+    pub fn new(standard: UpstreamConfig, deep: UpstreamConfig) -> Result<Self, reqwest::Error> {
         let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
 
         Ok(Self {
             client,
-            standard: Upstream {
-                api_key,
-                url: upstream_url,
-            },
-            deep: Upstream {
-                api_key: deep_api_key,
-                url: deep_upstream_url,
-            },
+            standard,
+            deep,
         })
     }
 
     /// Grok 4.3に検索クエリを送り、回答本文のみを返します。
     pub async fn search(&self, query: &str) -> Result<String, String> {
-        self.search_with_model(&self.standard, FAST_MODEL, FAST_INSTRUCTIONS, query)
+        self.search_with_model(&self.standard, FAST_MODEL, FAST_INSTRUCTIONS, query, None)
             .await
     }
 
     /// Grok 4.20 Multi-Agent 0309で詳細な調査を実行します。
     pub async fn deep_search(&self, query: &str) -> Result<String, String> {
-        self.search_with_model(&self.deep, DEEP_MODEL, DEEP_INSTRUCTIONS, query)
-            .await
+        self.search_with_model(
+            &self.deep,
+            DEEP_MODEL,
+            DEEP_INSTRUCTIONS,
+            query,
+            Some(DEEP_REASONING_EFFORT),
+        )
+        .await
     }
 
     async fn search_with_model(
         &self,
-        upstream: &Upstream,
+        upstream: &UpstreamConfig,
         model: &'static str,
         instructions: &'static str,
         query: &str,
+        reasoning_effort: Option<&'static str>,
     ) -> Result<String, String> {
-        let payload = ResponsesRequest {
-            model,
-            instructions,
-            input: query,
-            // 上流から継続的にイベントを受信し、ゲートウェイの待機タイムアウトを防ぎます。
-            stream: true,
-        };
+        // 上流から継続的にイベントを受信し、ゲートウェイの待機タイムアウトを防ぎます。
+        let payload = build_payload(upstream.format, model, instructions, query, reasoning_effort);
 
         let response = self
             .client
             .post(upstream.url.as_ref())
             .bearer_auth(upstream.api_key.as_ref())
-            .header("Accept", "text/event-stream")
+            .header("Accept", ACCEPT_VALUE)
             .json(&payload)
             .send()
             .await
@@ -107,15 +98,56 @@ impl GrokClient {
             .is_some_and(|value| value.starts_with("text/event-stream"));
 
         if is_event_stream {
-            read_streaming_answer(response).await
+            read_streaming_answer(response, upstream.format).await
         } else {
             // 互換APIがstream指定を無視して通常JSONを返す場合にも対応します。
             let body = response.text().await.map_err(|error| {
                 format!("Grok上流APIのレスポンスを読み取れませんでした: {error}")
             })?;
-            parse_non_streaming_answer(&body)
+            parse_non_streaming_answer(&body, upstream.format)
         }
     }
+}
+
+/// 上流の形式に合わせたリクエスト本文を構築します。
+fn build_payload<'a>(
+    format: ApiFormat,
+    model: &'static str,
+    instructions: &'static str,
+    query: &'a str,
+    reasoning_effort: Option<&'static str>,
+) -> RequestPayload<'a> {
+    match format {
+        ApiFormat::Responses => RequestPayload::Responses(ResponsesRequest {
+            model,
+            instructions,
+            input: query,
+            stream: true,
+            reasoning_effort,
+        }),
+        ApiFormat::Chat => RequestPayload::Chat(ChatRequest {
+            model,
+            messages: vec![
+                ChatMessage {
+                    role: "system",
+                    content: instructions,
+                },
+                ChatMessage {
+                    role: "user",
+                    content: query,
+                },
+            ],
+            stream: true,
+            reasoning_effort,
+        }),
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum RequestPayload<'a> {
+    Responses(ResponsesRequest<'a>),
+    Chat(ChatRequest<'a>),
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +156,25 @@ struct ResponsesRequest<'a> {
     instructions: &'static str,
     input: &'a str,
     stream: bool,
+    /// 通常検索では送信しません。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatRequest<'a> {
+    model: &'static str,
+    messages: Vec<ChatMessage<'a>>,
+    stream: bool,
+    /// 通常検索では送信しません。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatMessage<'a> {
+    role: &'static str,
+    content: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +183,7 @@ enum StreamControl {
     Completed,
 }
 
-async fn read_streaming_answer(response: Response) -> Result<String, String> {
+async fn read_streaming_answer(response: Response, format: ApiFormat) -> Result<String, String> {
     let mut events = response.bytes_stream().eventsource();
     let mut answer = String::new();
 
@@ -140,7 +191,8 @@ async fn read_streaming_answer(response: Response) -> Result<String, String> {
         let event =
             event.map_err(|error| format!("Grok上流APIのストリームが中断されました: {error}"))?;
 
-        if process_stream_event(&event.event, &event.data, &mut answer)? == StreamControl::Completed
+        if process_stream_event(format, &event.event, &event.data, &mut answer)?
+            == StreamControl::Completed
         {
             break;
         }
@@ -154,6 +206,7 @@ async fn read_streaming_answer(response: Response) -> Result<String, String> {
 }
 
 fn process_stream_event(
+    format: ApiFormat,
     event_name: &str,
     data: &str,
     answer: &mut String,
@@ -175,6 +228,18 @@ fn process_stream_event(
             ));
         }
     };
+
+    match format {
+        ApiFormat::Responses => process_responses_event(&event, event_name, answer),
+        ApiFormat::Chat => process_chat_event(&event, answer),
+    }
+}
+
+fn process_responses_event(
+    event: &Value,
+    event_name: &str,
+    answer: &mut String,
+) -> Result<StreamControl, String> {
     let event_type = event
         .get("type")
         .and_then(Value::as_str)
@@ -188,31 +253,71 @@ fn process_stream_event(
             Ok(StreamControl::Continue)
         }
         "response.output_text.done" => {
-            if let Some(text) = event.get("text").and_then(Value::as_str) {
-                *answer = text.to_owned();
+            // 出力パートごとに送信されるため、deltaを受信済みの場合は上書きしません。
+            if answer.is_empty()
+                && let Some(text) = event.get("text").and_then(Value::as_str)
+            {
+                answer.push_str(text);
             }
             Ok(StreamControl::Continue)
         }
         "response.completed" => {
-            let response = event.get("response").unwrap_or(&event);
-            if let Some(text) = extract_answer(response) {
+            let response = event.get("response").unwrap_or(event);
+            if let Some(text) = extract_responses_answer(response) {
                 *answer = text;
             }
             Ok(StreamControl::Completed)
         }
         "response.failed" | "response.incomplete" | "error" => Err(format!(
             "Grok上流APIの処理が完了しませんでした: {}",
-            extract_stream_error(&event)
+            extract_stream_error(event)
         )),
         _ => Ok(StreamControl::Continue),
     }
 }
 
-fn parse_non_streaming_answer(body: &str) -> Result<String, String> {
+fn process_chat_event(event: &Value, answer: &mut String) -> Result<StreamControl, String> {
+    // `"error": null` を返す実装があるため、null以外のみエラーとして扱います。
+    if event.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(format!(
+            "Grok上流APIの処理が完了しませんでした: {}",
+            extract_stream_error(event)
+        ));
+    }
+
+    let Some(choice) = event
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+    else {
+        return Ok(StreamControl::Continue);
+    };
+
+    if let Some(delta) = choice.pointer("/delta/content").and_then(Value::as_str) {
+        answer.push_str(delta);
+    }
+
+    let finished = choice
+        .get("finish_reason")
+        .is_some_and(|reason| !reason.is_null());
+
+    Ok(if finished {
+        StreamControl::Completed
+    } else {
+        StreamControl::Continue
+    })
+}
+
+fn parse_non_streaming_answer(body: &str, format: ApiFormat) -> Result<String, String> {
     let response: Value = serde_json::from_str(body)
         .map_err(|error| format!("Grok上流APIが不正なJSONを返しました: {error}"))?;
 
-    extract_answer(&response).ok_or_else(|| {
+    let answer = match format {
+        ApiFormat::Responses => extract_responses_answer(&response),
+        ApiFormat::Chat => extract_chat_answer(&response),
+    };
+
+    answer.ok_or_else(|| {
         format!(
             "Grok上流APIのレスポンスから回答を取得できませんでした: {}",
             truncate(body, ERROR_BODY_LIMIT)
@@ -220,7 +325,7 @@ fn parse_non_streaming_answer(body: &str) -> Result<String, String> {
     })
 }
 
-fn extract_answer(response: &Value) -> Option<String> {
+fn extract_responses_answer(response: &Value) -> Option<String> {
     // 一部のOpenAI互換APIが返すトップレベルの補助フィールドにも対応します。
     if let Some(text) = response.get("output_text").and_then(Value::as_str)
         && !text.trim().is_empty()
@@ -244,6 +349,14 @@ fn extract_answer(response: &Value) -> Option<String> {
         .join("\n");
 
     (!text.trim().is_empty()).then_some(text)
+}
+
+fn extract_chat_answer(response: &Value) -> Option<String> {
+    let text = response
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)?;
+
+    (!text.trim().is_empty()).then(|| text.to_owned())
 }
 
 fn extract_stream_error(event: &Value) -> String {
@@ -278,14 +391,70 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        DEEP_INSTRUCTIONS, DEEP_MODEL, FAST_INSTRUCTIONS, FAST_MODEL, GrokClient, StreamControl,
-        extract_answer, process_stream_event, truncate,
+        ApiFormat, DEEP_INSTRUCTIONS, DEEP_MODEL, DEEP_REASONING_EFFORT, FAST_INSTRUCTIONS,
+        FAST_MODEL, GrokClient, StreamControl, UpstreamConfig, build_payload, extract_chat_answer,
+        extract_responses_answer, process_stream_event, truncate,
     };
+
+    fn upstream(url: String, key: &str, format: ApiFormat) -> UpstreamConfig {
+        UpstreamConfig {
+            api_key: Arc::from(key),
+            url: Arc::from(url),
+            format,
+        }
+    }
 
     #[test]
     fn upstream_models_are_fixed() {
         assert_eq!(FAST_MODEL, "grok-4.3");
         assert_eq!(DEEP_MODEL, "grok-4.20-multi-agent-0309");
+    }
+
+    #[test]
+    fn builds_responses_payload() {
+        let payload = build_payload(
+            ApiFormat::Responses,
+            FAST_MODEL,
+            FAST_INSTRUCTIONS,
+            "問い合わせ",
+            None,
+        );
+        let json = serde_json::to_value(&payload).unwrap();
+
+        assert_eq!(json["model"], FAST_MODEL);
+        assert_eq!(json["instructions"], FAST_INSTRUCTIONS);
+        assert_eq!(json["input"], "問い合わせ");
+        assert_eq!(json["stream"], true);
+        assert!(json.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn builds_chat_payload() {
+        let payload = build_payload(
+            ApiFormat::Chat,
+            DEEP_MODEL,
+            DEEP_INSTRUCTIONS,
+            "問い合わせ",
+            Some(DEEP_REASONING_EFFORT),
+        );
+        let json = serde_json::to_value(&payload).unwrap();
+
+        assert_eq!(json["model"], DEEP_MODEL);
+        assert_eq!(json["messages"][0]["role"], "system");
+        assert_eq!(json["messages"][0]["content"], DEEP_INSTRUCTIONS);
+        assert_eq!(json["messages"][1]["role"], "user");
+        assert_eq!(json["messages"][1]["content"], "問い合わせ");
+        assert_eq!(json["stream"], true);
+        assert_eq!(json["reasoning_effort"], DEEP_REASONING_EFFORT);
+        assert!(json.get("input").is_none());
+    }
+
+    #[test]
+    fn standard_search_omits_reasoning_effort() {
+        let payload = build_payload(ApiFormat::Chat, FAST_MODEL, FAST_INSTRUCTIONS, "q", None);
+        let json = serde_json::to_value(&payload).unwrap();
+
+        assert!(json.get("reasoning_effort").is_none());
     }
 
     #[tokio::test]
@@ -316,7 +485,12 @@ mod tests {
                             headers["authorization"].to_str().unwrap().to_owned(),
                             payload,
                         ));
-                        Json(json!({ "output_text": "deep answer" }))
+                        Json(json!({
+                            "choices": [{
+                                "finish_reason": "stop",
+                                "message": { "role": "assistant", "content": "deep answer" }
+                            }]
+                        }))
                     }
                 }),
             );
@@ -326,10 +500,16 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = GrokClient::new(
-            Arc::from("standard-key"),
-            Arc::from(format!("http://{address}/standard")),
-            Arc::from("deep-key"),
-            Arc::from(format!("http://{address}/deep")),
+            upstream(
+                format!("http://{address}/standard"),
+                "standard-key",
+                ApiFormat::Responses,
+            ),
+            upstream(
+                format!("http://{address}/deep"),
+                "deep-key",
+                ApiFormat::Chat,
+            ),
         )
         .unwrap();
 
@@ -342,9 +522,11 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].0, "Bearer standard-key");
-        assert_eq!(requests[0].1["model"], FAST_MODEL);
+        assert_eq!(requests[0].1["input"], "standard query");
+        assert!(requests[0].1.get("reasoning_effort").is_none());
         assert_eq!(requests[1].0, "Bearer deep-key");
-        assert_eq!(requests[1].1["model"], DEEP_MODEL);
+        assert_eq!(requests[1].1["messages"][1]["content"], "deep query");
+        assert_eq!(requests[1].1["reasoning_effort"], DEEP_REASONING_EFFORT);
     }
 
     #[test]
@@ -368,7 +550,10 @@ mod tests {
             }]
         });
 
-        assert_eq!(extract_answer(&response).as_deref(), Some("検索結果です"));
+        assert_eq!(
+            extract_responses_answer(&response).as_deref(),
+            Some("検索結果です")
+        );
     }
 
     #[test]
@@ -386,14 +571,32 @@ mod tests {
             ]
         });
 
-        assert_eq!(extract_answer(&response).as_deref(), Some("1行目\n2行目"));
+        assert_eq!(
+            extract_responses_answer(&response).as_deref(),
+            Some("1行目\n2行目")
+        );
     }
 
     #[test]
     fn extracts_top_level_output_text() {
         let response = json!({ "output_text": "検索結果です" });
 
-        assert_eq!(extract_answer(&response).as_deref(), Some("検索結果です"));
+        assert_eq!(
+            extract_responses_answer(&response).as_deref(),
+            Some("検索結果です")
+        );
+    }
+
+    #[test]
+    fn extracts_chat_message_content() {
+        let response = json!({
+            "choices": [{ "message": { "content": "検索結果です" } }]
+        });
+
+        assert_eq!(
+            extract_chat_answer(&response).as_deref(),
+            Some("検索結果です")
+        );
     }
 
     #[test]
@@ -401,11 +604,13 @@ mod tests {
         let mut answer = String::new();
 
         let first = process_stream_event(
+            ApiFormat::Responses,
             "response.output_text.delta",
             r#"{"type":"response.output_text.delta","delta":"検索"}"#,
             &mut answer,
         );
         let second = process_stream_event(
+            ApiFormat::Responses,
             "response.output_text.delta",
             r#"{"type":"response.output_text.delta","delta":"結果"}"#,
             &mut answer,
@@ -414,6 +619,118 @@ mod tests {
         assert_eq!(first, Ok(StreamControl::Continue));
         assert_eq!(second, Ok(StreamControl::Continue));
         assert_eq!(answer, "検索結果");
+    }
+
+    #[test]
+    fn output_text_done_keeps_accumulated_deltas() {
+        let mut answer = String::new();
+
+        process_stream_event(
+            ApiFormat::Responses,
+            "response.output_text.delta",
+            r#"{"type":"response.output_text.delta","delta":"1つ目"}"#,
+            &mut answer,
+        )
+        .unwrap();
+        process_stream_event(
+            ApiFormat::Responses,
+            "response.output_text.done",
+            r#"{"type":"response.output_text.done","text":"1つ目"}"#,
+            &mut answer,
+        )
+        .unwrap();
+        process_stream_event(
+            ApiFormat::Responses,
+            "response.output_text.delta",
+            r#"{"type":"response.output_text.delta","delta":"2つ目"}"#,
+            &mut answer,
+        )
+        .unwrap();
+        process_stream_event(
+            ApiFormat::Responses,
+            "response.output_text.done",
+            r#"{"type":"response.output_text.done","text":"2つ目"}"#,
+            &mut answer,
+        )
+        .unwrap();
+
+        assert_eq!(answer, "1つ目2つ目");
+    }
+
+    #[test]
+    fn output_text_done_fills_answer_without_deltas() {
+        let mut answer = String::new();
+
+        let result = process_stream_event(
+            ApiFormat::Responses,
+            "response.output_text.done",
+            r#"{"type":"response.output_text.done","text":"回答のみ"}"#,
+            &mut answer,
+        );
+
+        assert_eq!(result, Ok(StreamControl::Continue));
+        assert_eq!(answer, "回答のみ");
+    }
+
+    #[test]
+    fn appends_chat_streaming_deltas() {
+        let mut answer = String::new();
+
+        let first = process_stream_event(
+            ApiFormat::Chat,
+            "message",
+            r#"{"choices":[{"delta":{"content":"検索"},"finish_reason":null}]}"#,
+            &mut answer,
+        );
+        let second = process_stream_event(
+            ApiFormat::Chat,
+            "message",
+            r#"{"choices":[{"delta":{"content":"結果"},"finish_reason":null}]}"#,
+            &mut answer,
+        );
+        let last = process_stream_event(
+            ApiFormat::Chat,
+            "message",
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            &mut answer,
+        );
+
+        assert_eq!(first, Ok(StreamControl::Continue));
+        assert_eq!(second, Ok(StreamControl::Continue));
+        assert_eq!(last, Ok(StreamControl::Completed));
+        assert_eq!(answer, "検索結果");
+    }
+
+    #[test]
+    fn ignores_null_error_field_in_chat_stream() {
+        let mut answer = String::new();
+
+        let result = process_stream_event(
+            ApiFormat::Chat,
+            "message",
+            r#"{"error":null,"choices":[{"delta":{"content":"検索結果"},"finish_reason":null}]}"#,
+            &mut answer,
+        );
+
+        assert_eq!(result, Ok(StreamControl::Continue));
+        assert_eq!(answer, "検索結果");
+    }
+
+    #[test]
+    fn reports_chat_stream_error() {
+        let mut answer = String::new();
+
+        let result = process_stream_event(
+            ApiFormat::Chat,
+            "message",
+            r#"{"error":{"message":"レート制限"}}"#,
+            &mut answer,
+        );
+
+        assert_eq!(
+            result,
+            Err("Grok上流APIの処理が完了しませんでした: レート制限".to_owned())
+        );
     }
 
     #[test]
@@ -430,7 +747,12 @@ mod tests {
         })
         .to_string();
 
-        let result = process_stream_event("response.completed", &data, &mut answer);
+        let result = process_stream_event(
+            ApiFormat::Responses,
+            "response.completed",
+            &data,
+            &mut answer,
+        );
 
         assert_eq!(result, Ok(StreamControl::Completed));
         assert_eq!(answer, "最終回答");
