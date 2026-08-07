@@ -1,14 +1,41 @@
-use std::{env, error::Error, fmt, sync::Arc};
+use std::{env, error::Error, fmt, str::FromStr, sync::Arc};
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:3000";
 const DEFAULT_ALLOWED_HOSTS: &str = "localhost,127.0.0.1,::1";
 
+/// 上流APIのリクエスト・レスポンス形式です。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApiFormat {
+    /// OpenAI Responses API互換（`input` / `output`）。
+    #[default]
+    Responses,
+    /// OpenAI Chat Completions API互換（`messages` / `choices`）。
+    Chat,
+}
+
+impl FromStr for ApiFormat {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "responses" | "response" => Ok(Self::Responses),
+            "chat" | "chat_completions" | "chat-completions" => Ok(Self::Chat),
+            _ => Err(ConfigError::InvalidApiFormat(value.trim().to_owned())),
+        }
+    }
+}
+
+/// 各検索モードの上流API設定です。
+pub struct UpstreamConfig {
+    pub api_key: Arc<str>,
+    pub url: Arc<str>,
+    pub format: ApiFormat,
+}
+
 /// アプリケーションの起動設定です。
 pub struct AppConfig {
-    pub api_key: Arc<str>,
-    pub upstream_url: Arc<str>,
-    pub deep_api_key: Arc<str>,
-    pub deep_upstream_url: Arc<str>,
+    pub standard: UpstreamConfig,
+    pub deep: UpstreamConfig,
     pub bind_addr: String,
     pub allowed_hosts: Vec<String>,
     /// 設定した場合のみ、MCPエンドポイントでBearerトークン認証を要求します。
@@ -20,33 +47,52 @@ impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
         dotenvy::dotenv().ok();
 
-        let api_key = env::var("GROK_API_KEY")
-            .map_err(|_| ConfigError::MissingVariable("GROK_API_KEY"))?
-            .into();
-        let upstream_url = env::var("GROK_UPSTREAM_URL")
-            .map_err(|_| ConfigError::MissingVariable("GROK_UPSTREAM_URL"))?
-            .into();
-        let deep_api_key = env::var("GROK_DEEP_API_KEY")
-            .map_err(|_| ConfigError::MissingVariable("GROK_DEEP_API_KEY"))?
-            .into();
-        let deep_upstream_url = env::var("GROK_DEEP_UPSTREAM_URL")
-            .map_err(|_| ConfigError::MissingVariable("GROK_DEEP_UPSTREAM_URL"))?
-            .into();
-        let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_owned());
+        let standard = UpstreamConfig {
+            api_key: required("GROK_API_KEY")?,
+            url: required("GROK_UPSTREAM_URL")?,
+            format: api_format("GROK_API_FORMAT")?,
+        };
+        let deep = UpstreamConfig {
+            api_key: required("GROK_DEEP_API_KEY")?,
+            url: required("GROK_DEEP_UPSTREAM_URL")?,
+            format: api_format("GROK_DEEP_API_FORMAT")?,
+        };
+        let bind_addr = optional("BIND_ADDR").unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned());
         let allowed_hosts = parse_allowed_hosts(
-            &env::var("MCP_ALLOWED_HOSTS").unwrap_or_else(|_| DEFAULT_ALLOWED_HOSTS.to_owned()),
+            &optional("MCP_ALLOWED_HOSTS").unwrap_or_else(|| DEFAULT_ALLOWED_HOSTS.to_owned()),
         );
-        let auth_token = env::var("MCP_AUTH_TOKEN").ok().and_then(parse_auth_token);
+        let auth_token = optional("MCP_AUTH_TOKEN").map(Arc::from);
 
         Ok(Self {
-            api_key,
-            upstream_url,
-            deep_api_key,
-            deep_upstream_url,
+            standard,
+            deep,
             bind_addr,
             allowed_hosts,
             auth_token,
         })
+    }
+}
+
+/// 空文字や空白のみの値は未設定として扱います。
+fn optional(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// 必須の環境変数を読み込みます。
+fn required(name: &'static str) -> Result<Arc<str>, ConfigError> {
+    optional(name)
+        .map(Arc::from)
+        .ok_or(ConfigError::MissingVariable(name))
+}
+
+/// 未設定の場合はResponses形式を既定として採用します。
+fn api_format(name: &str) -> Result<ApiFormat, ConfigError> {
+    match optional(name) {
+        Some(value) => value.parse(),
+        None => Ok(ApiFormat::default()),
     }
 }
 
@@ -59,17 +105,11 @@ fn parse_allowed_hosts(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// 空白のみの値を未設定として扱い、認証トークンを解析します。
-fn parse_auth_token(raw: String) -> Option<Arc<str>> {
-    let token = raw.trim();
-
-    (!token.is_empty()).then(|| Arc::from(token))
-}
-
 /// 設定の読み込みに失敗した場合のエラーです。
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ConfigError {
     MissingVariable(&'static str),
+    InvalidApiFormat(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -78,6 +118,10 @@ impl fmt::Display for ConfigError {
             Self::MissingVariable(name) => {
                 write!(formatter, "必須の環境変数 `{name}` が設定されていません")
             }
+            Self::InvalidApiFormat(value) => write!(
+                formatter,
+                "API形式 `{value}` は不正です。`responses` または `chat` を指定してください"
+            ),
         }
     }
 }
@@ -86,7 +130,28 @@ impl Error for ConfigError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_ALLOWED_HOSTS, parse_allowed_hosts, parse_auth_token};
+    use super::{ApiFormat, ConfigError, DEFAULT_ALLOWED_HOSTS, parse_allowed_hosts};
+
+    #[test]
+    fn parses_api_format_aliases() {
+        assert_eq!("responses".parse(), Ok(ApiFormat::Responses));
+        assert_eq!("Response".parse(), Ok(ApiFormat::Responses));
+        assert_eq!("chat".parse(), Ok(ApiFormat::Chat));
+        assert_eq!(" CHAT-COMPLETIONS ".parse(), Ok(ApiFormat::Chat));
+    }
+
+    #[test]
+    fn rejects_unknown_api_format() {
+        assert_eq!(
+            "grpc".parse::<ApiFormat>(),
+            Err(ConfigError::InvalidApiFormat("grpc".to_owned()))
+        );
+    }
+
+    #[test]
+    fn defaults_to_responses_format() {
+        assert_eq!(ApiFormat::default(), ApiFormat::Responses);
+    }
 
     #[test]
     fn parses_default_allowed_hosts() {
@@ -101,20 +166,6 @@ mod tests {
         assert_eq!(
             parse_allowed_hosts(" example.hf.space , ,localhost, "),
             ["example.hf.space", "localhost"]
-        );
-    }
-
-    #[test]
-    fn treats_blank_auth_token_as_unset() {
-        assert!(parse_auth_token(String::new()).is_none());
-        assert!(parse_auth_token("   ".to_owned()).is_none());
-    }
-
-    #[test]
-    fn trims_surrounding_whitespace_from_auth_token() {
-        assert_eq!(
-            parse_auth_token("  secret-token\n".to_owned()).as_deref(),
-            Some("secret-token")
         );
     }
 }
