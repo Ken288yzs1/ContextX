@@ -14,10 +14,12 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --create-home contextx
+    && useradd -m -u 1000 user
 
 COPY --from=builder /app/target/release/contextX /usr/local/bin/contextX
 
-USER contextx
-EXPOSE 3000
+USER user
+ENV HOME=/home/user \
+    BIND_ADDR=0.0.0.0:7860
+EXPOSE 7860
 ENTRYPOINT ["/usr/local/bin/contextX"]
