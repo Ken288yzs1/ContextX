@@ -10,15 +10,17 @@ use crate::config::{ApiFormat, UpstreamConfig};
 
 /// 利用者からモデルを変更できないよう、各検索機能の上流モデルを固定します。
 const FAST_MODEL: &str = "grok-4.3";
+/// 深度検索と究極検索で共用します。
 const DEEP_MODEL: &str = "grok-4.20-multi-agent-0309";
-/// 深度検索では最大限の推論を行わせます。
-const DEEP_REASONING_EFFORT: &str = "xhigh";
+/// 究極検索でのみ最大限の推論を要求します。
+const ULTRA_REASONING_EFFORT: &str = "xhigh";
 /// 上流モデルへの固定指示は英語で記述し、利用者の入力言語で回答させます。
 const FAST_INSTRUCTIONS: &str = "You are a web search assistant. Search the web and X when relevant. Provide an accurate and concise answer in the same language as the user's query. Include direct source URLs whenever available. Never fabricate sources, URLs, or claims. If no reliable information is available, clearly state that no reliable information was found and briefly suggest how to verify it. Never return an empty response.";
 const DEEP_INSTRUCTIONS: &str = "You are a deep research assistant. Conduct a comprehensive search of the web and X when relevant, and cross-check multiple reliable sources. Provide a detailed and well-structured answer in the same language as the user's query. Include direct source URLs whenever available, distinguish confirmed facts from uncertainty, and never fabricate sources, URLs, or claims. If no reliable information is available, clearly state that no reliable information was found and explain how to verify it. Never return an empty response.";
+const ULTRA_INSTRUCTIONS: &str = "You are an exhaustive research assistant operating at maximum rigor. Search the web and X extensively, gather every relevant primary source, and cross-verify each material claim against at least two independent reliable sources. Decompose the question into sub-questions, investigate each one, and reconcile conflicting evidence explicitly. Provide an exhaustive, well-structured answer in the same language as the user's query, organized with clear headings, and state the reasoning behind each conclusion. Include direct source URLs for every substantive claim, note publication dates when recency matters, and clearly separate confirmed facts, contested points, and your own inference. Never fabricate sources, URLs, or claims, and never present speculation as fact. If no reliable information is available, clearly state that no reliable information was found and explain in detail how to verify it. Never return an empty response.";
 /// 互換APIがstream指定を無視してJSONを返す場合にも備え、両方の形式を受け付けます。
 const ACCEPT_VALUE: &str = "text/event-stream, application/json";
-/// 深度検索の推論が長時間に及ぶため、十分な待機時間を確保します。
+/// 究極検索の推論が長時間に及ぶため、十分な待機時間を確保します。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const ERROR_BODY_LIMIT: usize = 1_000;
 
@@ -48,12 +50,18 @@ impl GrokClient {
 
     /// Grok 4.20 Multi-Agent 0309で詳細な調査を実行します。
     pub async fn deep_search(&self, query: &str) -> Result<String, String> {
+        self.search_with_model(&self.deep, DEEP_MODEL, DEEP_INSTRUCTIONS, query, None)
+            .await
+    }
+
+    /// 深度検索と同じ上流に対し、最大限の推論を要求して徹底的な調査を実行します。
+    pub async fn ultra_search(&self, query: &str) -> Result<String, String> {
         self.search_with_model(
             &self.deep,
             DEEP_MODEL,
-            DEEP_INSTRUCTIONS,
+            ULTRA_INSTRUCTIONS,
             query,
-            Some(DEEP_REASONING_EFFORT),
+            Some(ULTRA_REASONING_EFFORT),
         )
         .await
     }
@@ -156,7 +164,7 @@ struct ResponsesRequest<'a> {
     instructions: &'static str,
     input: &'a str,
     stream: bool,
-    /// 通常検索では送信しません。
+    /// 究極検索以外では送信しません。
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
 }
@@ -166,7 +174,7 @@ struct ChatRequest<'a> {
     model: &'static str,
     messages: Vec<ChatMessage<'a>>,
     stream: bool,
-    /// 通常検索では送信しません。
+    /// 究極検索以外では送信しません。
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
 }
@@ -391,9 +399,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ApiFormat, DEEP_INSTRUCTIONS, DEEP_MODEL, DEEP_REASONING_EFFORT, FAST_INSTRUCTIONS,
-        FAST_MODEL, GrokClient, StreamControl, UpstreamConfig, build_payload, extract_chat_answer,
-        extract_responses_answer, process_stream_event, truncate,
+        ApiFormat, DEEP_INSTRUCTIONS, DEEP_MODEL, FAST_INSTRUCTIONS, FAST_MODEL, GrokClient,
+        StreamControl, ULTRA_INSTRUCTIONS, ULTRA_REASONING_EFFORT, UpstreamConfig, build_payload,
+        extract_chat_answer, extract_responses_answer, process_stream_event, truncate,
     };
 
     fn upstream(url: String, key: &str, format: ApiFormat) -> UpstreamConfig {
@@ -433,19 +441,19 @@ mod tests {
         let payload = build_payload(
             ApiFormat::Chat,
             DEEP_MODEL,
-            DEEP_INSTRUCTIONS,
+            ULTRA_INSTRUCTIONS,
             "問い合わせ",
-            Some(DEEP_REASONING_EFFORT),
+            Some(ULTRA_REASONING_EFFORT),
         );
         let json = serde_json::to_value(&payload).unwrap();
 
         assert_eq!(json["model"], DEEP_MODEL);
         assert_eq!(json["messages"][0]["role"], "system");
-        assert_eq!(json["messages"][0]["content"], DEEP_INSTRUCTIONS);
+        assert_eq!(json["messages"][0]["content"], ULTRA_INSTRUCTIONS);
         assert_eq!(json["messages"][1]["role"], "user");
         assert_eq!(json["messages"][1]["content"], "問い合わせ");
         assert_eq!(json["stream"], true);
-        assert_eq!(json["reasoning_effort"], DEEP_REASONING_EFFORT);
+        assert_eq!(json["reasoning_effort"], ULTRA_REASONING_EFFORT);
         assert!(json.get("input").is_none());
     }
 
@@ -457,8 +465,16 @@ mod tests {
         assert!(json.get("reasoning_effort").is_none());
     }
 
+    #[test]
+    fn deep_search_omits_reasoning_effort() {
+        let payload = build_payload(ApiFormat::Chat, DEEP_MODEL, DEEP_INSTRUCTIONS, "q", None);
+        let json = serde_json::to_value(&payload).unwrap();
+
+        assert!(json.get("reasoning_effort").is_none());
+    }
+
     #[tokio::test]
-    async fn search_modes_use_separate_upstreams() {
+    async fn search_modes_use_expected_upstreams() {
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let standard_requests = Arc::clone(&requests);
         let deep_requests = Arc::clone(&requests);
@@ -515,27 +531,40 @@ mod tests {
 
         let standard_answer = client.search("standard query").await;
         let deep_answer = client.deep_search("deep query").await;
+        let ultra_answer = client.ultra_search("ultra query").await;
         server.abort();
 
         assert_eq!(standard_answer.as_deref(), Ok("standard answer"));
         assert_eq!(deep_answer.as_deref(), Ok("deep answer"));
+        assert_eq!(ultra_answer.as_deref(), Ok("deep answer"));
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(requests[0].0, "Bearer standard-key");
         assert_eq!(requests[0].1["input"], "standard query");
         assert!(requests[0].1.get("reasoning_effort").is_none());
         assert_eq!(requests[1].0, "Bearer deep-key");
+        assert_eq!(requests[1].1["messages"][0]["content"], DEEP_INSTRUCTIONS);
         assert_eq!(requests[1].1["messages"][1]["content"], "deep query");
-        assert_eq!(requests[1].1["reasoning_effort"], DEEP_REASONING_EFFORT);
+        assert!(requests[1].1.get("reasoning_effort").is_none());
+        assert_eq!(requests[2].0, "Bearer deep-key");
+        assert_eq!(requests[2].1["messages"][0]["content"], ULTRA_INSTRUCTIONS);
+        assert_eq!(requests[2].1["messages"][1]["content"], "ultra query");
+        assert_eq!(requests[2].1["reasoning_effort"], ULTRA_REASONING_EFFORT);
     }
 
     #[test]
     fn upstream_instructions_are_english() {
-        for instructions in [FAST_INSTRUCTIONS, DEEP_INSTRUCTIONS] {
+        for instructions in [FAST_INSTRUCTIONS, DEEP_INSTRUCTIONS, ULTRA_INSTRUCTIONS] {
             assert!(instructions.is_ascii());
             assert!(instructions.contains("same language as the user's query"));
             assert!(instructions.contains("Never return an empty response"));
         }
+    }
+
+    #[test]
+    fn ultra_instructions_are_strictest() {
+        assert!(ULTRA_INSTRUCTIONS.len() > DEEP_INSTRUCTIONS.len());
+        assert!(ULTRA_INSTRUCTIONS.contains("cross-verify"));
     }
 
     #[test]
