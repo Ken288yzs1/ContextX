@@ -35,46 +35,61 @@ impl ContextXServer {
     }
 }
 
+/// 空のクエリを上流に送らないよう検証します。
+fn validate_query(query: &str) -> Result<&str, ErrorData> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(ErrorData::invalid_params(
+            "`query`には空でない文字列を指定してください",
+            None,
+        ));
+    }
+
+    Ok(query)
+}
+
+/// 検索結果をMCPのツール応答へ変換します。
+fn into_tool_result(answer: Result<String, String>) -> Result<CallToolResult, ErrorData> {
+    match answer {
+        Ok(answer) => Ok(CallToolResult::success(vec![ContentBlock::text(answer)])),
+        Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
+    }
+}
+
 #[tool_router]
 impl ContextXServer {
-    #[tool(description = "Grok 4.3でウェブ検索し、質問に回答します")]
+    #[tool(description = "【普通検索】Grok 4.3でウェブ検索し、質問に簡潔に回答します。既定の検索手段として使用します")]
     async fn grok_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let query = params.query.trim();
-        if query.is_empty() {
-            return Err(ErrorData::invalid_params(
-                "`query`には空でない文字列を指定してください",
-                None,
-            ));
-        }
+        let query = validate_query(&params.query)?;
 
-        match self.grok_client.search(query).await {
-            Ok(answer) => Ok(CallToolResult::success(vec![ContentBlock::text(answer)])),
-            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
-        }
+        into_tool_result(self.grok_client.search(query).await)
     }
 
     #[tool(
-        description = "Grok 4.20 Multi-Agent 0309で包括的な深度検索を実行します。利用者が深度検索を明示的に要求した場合に使用します"
+        description = "【深度検索】Grok 4.20 Multi-Agent 0309で複数の情報源を照合し、包括的に調査します。利用者が深度検索を明示的に要求した場合に使用します"
     )]
     async fn grok_deep_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let query = params.query.trim();
-        if query.is_empty() {
-            return Err(ErrorData::invalid_params(
-                "`query`には空でない文字列を指定してください",
-                None,
-            ));
-        }
+        let query = validate_query(&params.query)?;
 
-        match self.grok_client.deep_search(query).await {
-            Ok(answer) => Ok(CallToolResult::success(vec![ContentBlock::text(answer)])),
-            Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
-        }
+        into_tool_result(self.grok_client.deep_search(query).await)
+    }
+
+    #[tool(
+        description = "【究極検索】Grok 4.20 Multi-Agent 0309に最大限の推論を行わせ、徹底的に検証した詳細な調査結果を返します。応答に数分かかるため、利用者が究極検索を明示的に要求した場合にのみ使用します"
+    )]
+    async fn grok_ultra_search(
+        &self,
+        Parameters(params): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let query = validate_query(&params.query)?;
+
+        into_tool_result(self.grok_client.ultra_search(query).await)
     }
 }
 
@@ -87,7 +102,7 @@ impl ServerHandler for ContextXServer {
                     .with_title("contextX Grok検索"),
             )
             .with_instructions(
-                "通常検索にはGrok 4.3を使用します。利用者が深度検索を明示的に要求した場合は、Grok 4.20 Multi-Agent 0309による深度検索を使用します。",
+                "検索は3段階です。普通検索（grok_search、Grok 4.3）を既定として使用します。利用者が深度検索を明示的に要求した場合は深度検索（grok_deep_search）を使用します。利用者が究極検索を明示的に要求した場合のみ究極検索（grok_ultra_search）を使用します。究極検索は最大限の推論を行うため応答に数分かかります。",
             )
     }
 }
